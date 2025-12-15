@@ -1,5 +1,7 @@
 import os
 import sqlite3
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -90,25 +92,31 @@ TEAM_LOGOS = {
     "Wolves": "https://resources.premierleague.com/premierleague/badges/70/t39.png",
 }
 
-# EPL logo (public SVG)
 EPL_LOGO_URL = "https://upload.wikimedia.org/wikipedia/en/f/f2/Premier_League_Logo.svg"
 
-# Result mapping (UI)
 FTR_TO_TEXT = {"H": "Home Win", "D": "Draw", "A": "Away Win"}
 TEXT_TO_FTR = {"Home Win": "H", "Draw": "D", "Away Win": "A"}
 
 # ------------------------------------------------------------
 # DATABASE
 # ------------------------------------------------------------
-DB_PATH = "epl_2018_2019.db"
+DB_PATH = Path("epl_2018_2019.db")
 
-@st.cache_resource
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Fresh connection each time -> avoids stale reads after UPDATE
+    return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
 
-@st.cache_data
-def read_df(sql, params=()):
-    return pd.read_sql_query(sql, get_conn(), params=params)
+@st.cache_data(show_spinner=False)
+def read_df(sql: str, params: tuple = ()):
+    with get_conn() as conn:
+        return pd.read_sql_query(sql, conn, params=params)
+
+def run_update(sql: str, params: tuple = ()):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+        return cur.rowcount
 
 # ------------------------------------------------------------
 # SIDEBAR CONTROLS
@@ -138,6 +146,12 @@ JOIN Teams t2 ON m.AwayTeamID = t2.TeamID
 JOIN Referees r ON m.RefereeID = r.RefereeID
 ORDER BY m.MatchDate DESC;
 """
+
+# Guard: DB existence
+if not DB_PATH.exists():
+    st.error(f"Database file not found: {DB_PATH.resolve()}")
+    st.stop()
+
 df_all = read_df(BASE_SQL)
 
 teams = sorted(set(df_all["HomeTeam"]).union(df_all["AwayTeam"]))
@@ -166,16 +180,13 @@ if st.sidebar.button("Reset filters"):
 df_view = df_all.copy()
 
 if selected_team:
-    df_view = df_view[
-        (df_view["HomeTeam"] == selected_team) |
-        (df_view["AwayTeam"] == selected_team)
-    ]
+    df_view = df_view[(df_view["HomeTeam"] == selected_team) | (df_view["AwayTeam"] == selected_team)]
 
 if selected_ref:
     df_view = df_view[df_view["RefereeName"] == selected_ref]
 
 # ------------------------------------------------------------
-# HEADER (EPL LOGO + TITLE)
+# HEADER
 # ------------------------------------------------------------
 st.markdown(
     f"""
@@ -203,7 +214,6 @@ if story_mode:
     )
     st.caption("Branding is used for *visual inspiration only* as part of an academic project.")
 
-# Team overview header (optional)
 if selected_team and selected_team in TEAM_LOGOS:
     c1, c2 = st.columns([1, 7])
     with c1:
@@ -212,7 +222,7 @@ if selected_team and selected_team in TEAM_LOGOS:
         st.markdown(f"### {selected_team} — Filtered Season View")
 
 # ------------------------------------------------------------
-# KPI METRICS (FILTERED)
+# KPI METRICS
 # ------------------------------------------------------------
 total_matches = int(len(df_view))
 unique_teams = int(len(set(df_view["HomeTeam"]).union(df_view["AwayTeam"])))
@@ -228,9 +238,7 @@ k4.metric("Total cards (filtered)", total_cards)
 k5.metric("Avg goals / match", avg_goals)
 
 if story_mode and total_matches > 0:
-    st.info(
-        "Tip: Use **Team** filters to see club-specific performance, or **Referee** filters to explore officiating patterns."
-    )
+    st.info("Tip: Use **Team** filters for club-specific performance, or **Referee** filters for officiating patterns.")
 
 st.divider()
 
@@ -250,8 +258,6 @@ with tab_browse:
 
     df_show = df_view.copy()
     df_show["Score"] = df_show["FTHG"].astype(str) + " - " + df_show["FTAG"].astype(str)
-
-    # OPTION 3: Replace H/D/A with readable text in the table (and CSV)
     df_show["Full-Time Result"] = df_show["FTR"].map(FTR_TO_TEXT).fillna(df_show["FTR"])
 
     if search:
@@ -339,57 +345,82 @@ with tab_compare:
 # ---------------- CRUD TAB ----------------
 with tab_crud:
     st.subheader("CRUD Demo (UPDATE)")
-    st.info("This operation updates the local SQLite database for demonstration purposes (stores H/D/A internally).")
+    st.info("This updates the SQLite DB for demo purposes. On Streamlit Cloud, changes may reset on redeploy (expected).")
+
+    # Helpful: show a few valid MatchIDs to avoid wrong ID in demo
+    example_ids = df_all["MatchID"].head(5).tolist()
+    st.caption(f"Example MatchIDs you can try: {example_ids}")
 
     c1, c2 = st.columns(2)
     with c1:
-        match_id = st.number_input("MatchID", min_value=1, step=1)
+        match_id = st.number_input("MatchID", min_value=1, step=1, value=int(example_ids[0]) if example_ids else 1)
     with c2:
         new_ftr_label = st.selectbox("New full-time result", ["Home Win", "Draw", "Away Win"])
 
     new_ftr_code = TEXT_TO_FTR[new_ftr_label]
 
     if st.button("Update Match Result", type="primary"):
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE Matches SET FTR=? WHERE MatchID=?", (new_ftr_code, int(match_id)))
-        conn.commit()
-
-        # Clear cached reads so UI reflects updates
-        st.cache_data.clear()
-
-        st.success(f"Updated MatchID {int(match_id)} → {new_ftr_label} (stored as '{new_ftr_code}')")
-
-        # Show updated row (proof in demo video)
-        updated_sql = """
-        SELECT
-          m.MatchID, m.MatchDate,
-          t1.TeamName AS HomeTeam, t2.TeamName AS AwayTeam,
-          m.FTHG, m.FTAG, m.FTR, r.RefereeName
-        FROM Matches m
-        JOIN Teams t1 ON m.HomeTeamID = t1.TeamID
-        JOIN Teams t2 ON m.AwayTeamID = t2.TeamID
-        JOIN Referees r ON m.RefereeID = r.RefereeID
-        WHERE m.MatchID = ?;
-        """
-        df_updated = read_df(updated_sql, (int(match_id),))
-        if not df_updated.empty:
-            df_updated["Full-Time Result"] = df_updated["FTR"].map(FTR_TO_TEXT).fillna(df_updated["FTR"])
-            st.dataframe(
-                df_updated[["MatchID", "MatchDate", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Full-Time Result", "RefereeName"]],
-                width="stretch"
+        # 1) verify match exists
+        exists_sql = "SELECT 1 FROM Matches WHERE MatchID = ? LIMIT 1;"
+        exists_df = read_df(exists_sql, (int(match_id),))
+        if exists_df.empty:
+            st.error(f"MatchID {int(match_id)} not found in the database. Try a valid MatchID from the Browse tab.")
+        else:
+            # 2) do update + check affected rows
+            rowcount = run_update(
+                "UPDATE Matches SET FTR = ? WHERE MatchID = ?;",
+                (new_ftr_code, int(match_id))
             )
+
+            if rowcount == 0:
+                st.warning("No rows were updated (unexpected). Double-check MatchID.")
+            else:
+                # 3) Clear cached reads + rerun so KPIs/Browse reflect the change
+                st.cache_data.clear()
+                st.success(f"Updated MatchID {int(match_id)} → {new_ftr_label} (stored as '{new_ftr_code}')")
+                st.rerun()
+
+    # After rerun, user can confirm update via a live query:
+    st.markdown("#### Verify current value")
+    verify_id = st.number_input("Verify MatchID", min_value=1, step=1, value=int(match_id))
+    verify_sql = """
+    SELECT
+      m.MatchID, m.MatchDate,
+      t1.TeamName AS HomeTeam, t2.TeamName AS AwayTeam,
+      m.FTHG, m.FTAG, m.FTR, r.RefereeName
+    FROM Matches m
+    JOIN Teams t1 ON m.HomeTeamID = t1.TeamID
+    JOIN Teams t2 ON m.AwayTeamID = t2.TeamID
+    JOIN Referees r ON m.RefereeID = r.RefereeID
+    WHERE m.MatchID = ?;
+    """
+    df_updated = read_df(verify_sql, (int(verify_id),))
+    if not df_updated.empty:
+        df_updated["Full-Time Result"] = df_updated["FTR"].map(FTR_TO_TEXT).fillna(df_updated["FTR"])
+        st.dataframe(
+            df_updated[["MatchID", "MatchDate", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Full-Time Result", "RefereeName"]],
+            width="stretch"
+        )
 
 # ------------------------------------------------------------
 # FOOTER
 # ------------------------------------------------------------
 st.divider()
 st.caption(
-    "Data source: English Premier League 2018–2019 season. "
+    "Data source: DataCamp Soccer Data – English Premier League 2018–2019 season. "
     "Data stored in a normalized SQLite database. "
     "All analytics are computed via SQL queries at runtime."
 )
 
 if show_debug:
     st.write("Working directory:", os.getcwd())
-    st.write("Database exists:", os.path.exists(DB_PATH))
+    st.write("DB path:", DB_PATH.resolve())
+    st.write("Database exists:", DB_PATH.exists())
+    # Attempt to create a temp file to check write permission
+    try:
+        tmp = Path("._write_test.txt")
+        tmp.write_text("ok")
+        tmp.unlink()
+        st.success("Filesystem write check: OK")
+    except Exception as e:
+        st.warning(f"Filesystem write check failed: {e}")
